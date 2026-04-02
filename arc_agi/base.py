@@ -152,7 +152,14 @@ class Arcade:
 
         # Scan for available environments
         self.available_environments: list[EnvironmentInfo] = []
-        self._scan_for_environments()
+        # Respect the documented mode contract: ONLINE/COMPETITION list remote
+        # environments only, while NORMAL includes local + remote and OFFLINE
+        # includes local only.
+        if (
+            self.operation_mode != OperationMode.ONLINE
+            and self.operation_mode != OperationMode.COMPETITION
+        ):
+            self._scan_for_environments()
 
         if (
             self.operation_mode == OperationMode.ONLINE
@@ -620,6 +627,7 @@ class Arcade:
             else:
                 base_id = game_id
                 version = None
+            requested_game_id = game_id
 
             # OFFLINE mode: search in scanned environments only
             if self.operation_mode == OperationMode.OFFLINE:
@@ -645,6 +653,7 @@ class Arcade:
                     seed,
                     render_mode,
                     renderer,
+                    requested_game_id=requested_game_id,
                 )
 
             # ONLINE mode: create remote wrapper
@@ -656,6 +665,7 @@ class Arcade:
                 include_frame_data,
                 render_mode,
                 renderer,
+                requested_game_id=requested_game_id,
             )
 
     def _find_local_game(
@@ -852,6 +862,46 @@ class Arcade:
             )
             return None
 
+    @staticmethod
+    def _metadata_lookup_candidates(
+        game_id: str,
+        version: Optional[str],
+        requested_game_id: Optional[str],
+    ) -> list[str]:
+        """Return metadata lookup IDs, preferring the exact requested full ID.
+
+        Newer public environments use full IDs like ``cf01-v1``. Those do not
+        reliably round-trip through base-ID lookups, so exact IDs must be tried
+        first. Older environments still work with base IDs, so keep that as a
+        compatibility fallback.
+        """
+        candidates: list[str] = []
+        for candidate in (
+            requested_game_id,
+            f"{game_id}-{version}" if version else None,
+            game_id,
+        ):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    def _fetch_metadata_for_requested_game(
+        self,
+        game_id: str,
+        version: Optional[str],
+        requested_game_id: Optional[str],
+    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        """Resolve metadata for one requested game, preserving exact-ID semantics."""
+        for lookup_game_id in self._metadata_lookup_candidates(
+            game_id=game_id,
+            version=version,
+            requested_game_id=requested_game_id,
+        ):
+            metadata = self._fetch_metadata(lookup_game_id)
+            if metadata is not None:
+                return metadata, lookup_game_id
+        return None, None
+
     def _create_remote_wrapper(
         self,
         game_id: str,
@@ -861,6 +911,7 @@ class Arcade:
         include_frame_data: bool,
         render_mode: Optional[str] = None,
         renderer: Optional[Callable[[int, FrameDataRaw], None]] = None,
+        requested_game_id: Optional[str] = None,
     ) -> Optional[RemoteEnvironmentWrapper]:
         """Create a RemoteEnvironmentWrapper for online-only mode.
 
@@ -877,22 +928,20 @@ class Arcade:
             return None
 
         try:
-            # Fetch metadata to get exact game_id with version
-            metadata = self._fetch_metadata(game_id)
+            # Fetch metadata using the exact requested ID first. This keeps
+            # full IDs like cf01-v1 compatible with the live API while still
+            # falling back to older base-ID behavior when needed.
+            metadata, matched_lookup_id = self._fetch_metadata_for_requested_game(
+                game_id=game_id,
+                version=version,
+                requested_game_id=requested_game_id,
+            )
             if metadata is None:
                 return None
 
-            # Get full game_id with version from metadata
-            full_game_id = metadata.get("game_id", game_id)
-            if version and full_game_id != f"{game_id}-{version}":
-                # If version was provided, construct full_game_id
-                full_game_id = f"{game_id}-{version}"
-            elif not version and "-" not in full_game_id:
-                # If no version in metadata, we need to get it from the API response
-                # For now, use the game_id from metadata
-                self.logger.warning(
-                    f"Could not determine version for {game_id}, using {full_game_id}"
-                )
+            full_game_id = metadata.get("game_id") or matched_lookup_id or requested_game_id or (
+                f"{game_id}-{version}" if version else game_id
+            )
 
             # Create EnvironmentInfo from metadata
             env_info = EnvironmentInfo(
@@ -945,6 +994,7 @@ class Arcade:
         seed: int = 0,
         render_mode: Optional[str] = None,
         renderer: Optional[Callable[[int, FrameDataRaw], None]] = None,
+        requested_game_id: Optional[str] = None,
     ) -> Optional[LocalEnvironmentWrapper]:
         """Download game metadata and source from API.
 
@@ -961,8 +1011,14 @@ class Arcade:
             return None
 
         try:
-            # Fetch metadata
-            metadata = self._fetch_metadata(game_id)
+            # Fetch metadata using the exact requested ID first. Without this,
+            # newly introduced full IDs like cf01-v1 can appear in the public
+            # listing but fail to mirror locally.
+            metadata, matched_lookup_id = self._fetch_metadata_for_requested_game(
+                game_id=game_id,
+                version=version,
+                requested_game_id=requested_game_id,
+            )
             if metadata is None:
                 return self._find_local_game(
                     game_id,
@@ -975,19 +1031,19 @@ class Arcade:
                     renderer,
                 )
 
-            # Get version from metadata if not provided
-            if version is None:
-                version = (
-                    metadata.get("version")
-                    or metadata.get("game_id", "").split("-")[-1]
-                    if "-" in metadata.get("game_id", "")
-                    else None
-                )
+            full_game_id = metadata.get("game_id") or matched_lookup_id or requested_game_id or (
+                f"{game_id}-{version}" if version else game_id
+            )
+            if "-" in full_game_id:
+                storage_game_id, resolved_version = full_game_id.split("-", 1)
+            else:
+                storage_game_id = game_id
+                resolved_version = version or metadata.get("version")
 
             # Create directory structure: {environment_files}/{game_id}/{version}
-            env_dir = Path(self.environments_dir) / game_id
-            if version:
-                env_dir = env_dir / version
+            env_dir = Path(self.environments_dir) / storage_game_id
+            if resolved_version:
+                env_dir = env_dir / resolved_version
             env_dir.mkdir(parents=True, exist_ok=True)
 
             # Add date_downloaded to metadata before saving
@@ -996,6 +1052,7 @@ class Arcade:
             metadata["baseline_actions"] = metadata.get("baseline_actions", [])
             metadata["local_dir"] = str(env_dir)
             metadata["date_downloaded"] = date_downloaded.isoformat()
+            metadata["game_id"] = full_game_id
 
             # Save metadata.json
             metadata_file = env_dir / "metadata.json"
@@ -1009,9 +1066,7 @@ class Arcade:
 
             # Create EnvironmentInfo
             env_info = EnvironmentInfo(
-                game_id=metadata.get(
-                    "game_id", f"{game_id}-{version}" if version else game_id
-                ),
+                game_id=full_game_id,
                 title=metadata.get("title", game_id),
                 tags=metadata.get("tags", []),
                 baseline_actions=metadata.get("baseline_actions", []),
@@ -1036,7 +1091,7 @@ class Arcade:
                 )
 
             # Download source code
-            source_url = f"{self.arc_base_url}/api/games/{game_id}-{version}/source"
+            source_url = f"{self.arc_base_url}/api/games/{full_game_id}/source"
             headers = {
                 "X-Api-Key": self.arc_api_key,
                 "Accept": "application/json",
@@ -1056,7 +1111,7 @@ class Arcade:
             source_file.write_text(source_code, encoding="utf-8")
 
             self.logger.info(
-                f"Successfully downloaded game {game_id} (version: {version}) to {env_dir}"
+                f"Successfully downloaded game {full_game_id} to {env_dir}"
             )
 
             # Create and return LocalEnvironmentWrapper

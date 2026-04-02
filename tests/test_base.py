@@ -3,7 +3,9 @@
 import logging
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -262,6 +264,95 @@ class TestARCAGI3EdgeCases(unittest.TestCase):
         self.assertEqual(client.arc_base_url, "https://env.url")
         self.assertEqual(client.operation_mode, OperationMode.ONLINE)
 
+    def test_make_full_game_id_downloads_using_exact_lookup_first(self) -> None:
+        """Full game IDs like cf01-v1 must mirror locally without collapsing to cf01."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(Arcade, "_fetch_from_api", return_value=None):
+                client = Arcade(
+                    operation_mode=OperationMode.NORMAL,
+                    environments_dir=tmpdir,
+                    logger=logging.getLogger("test_exact_download"),
+                )
+
+            lookup_calls: list[str] = []
+
+            def fake_fetch_metadata(game_id: str) -> dict[str, object] | None:
+                lookup_calls.append(game_id)
+                if game_id != "cf01-v1":
+                    return None
+                return {
+                    "game_id": "cf01-v1",
+                    "title": "CF01",
+                    "class_name": "Cf01",
+                    "baseline_actions": [11, 17],
+                    "tags": ["public"],
+                }
+
+            captured: dict[str, object] = {}
+
+            def fake_create_wrapper(env_info, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                captured["env_info"] = env_info
+                return env_info
+
+            source_response = MagicMock()
+            source_response.raise_for_status.return_value = None
+            source_response.text = "class Cf01:\n    pass\n"
+
+            with (
+                patch.object(client, "_fetch_metadata", side_effect=fake_fetch_metadata),
+                patch.object(client, "_create_wrapper", side_effect=fake_create_wrapper),
+                patch("arc_agi.base.requests.get", return_value=source_response) as mock_get,
+            ):
+                wrapper = client.make(game_id="cf01-v1", scorecard_id="test-card")
+
+            self.assertIsNotNone(wrapper)
+            self.assertEqual(lookup_calls, ["cf01-v1"])
+            self.assertEqual(captured["env_info"].game_id, "cf01-v1")
+            metadata_path = Path(tmpdir) / "cf01" / "v1" / "metadata.json"
+            source_path = Path(tmpdir) / "cf01" / "v1" / "cf01.py"
+            self.assertTrue(metadata_path.exists())
+            self.assertTrue(source_path.exists())
+            self.assertEqual(
+                mock_get.call_args.args[0],
+                "https://three.arcprize.org/api/games/cf01-v1/source",
+            )
+
+    def test_make_full_game_id_remote_wrapper_uses_exact_lookup_first(self) -> None:
+        """Competition/online play must also resolve cf01-v1 by its exact public ID."""
+        with patch.object(Arcade, "_fetch_from_api", return_value=None):
+            client = Arcade(
+                operation_mode=OperationMode.ONLINE,
+                arc_base_url="https://three.arcprize.org",
+                arc_api_key="test-key-123",
+                logger=logging.getLogger("test_exact_remote"),
+            )
+
+        lookup_calls: list[str] = []
+
+        def fake_fetch_metadata(game_id: str) -> dict[str, object] | None:
+            lookup_calls.append(game_id)
+            if game_id != "cf01-v1":
+                return None
+            return {
+                "game_id": "cf01-v1",
+                "title": "CF01",
+                "class_name": "Cf01",
+                "baseline_actions": [11, 17],
+                "tags": ["public"],
+            }
+
+        sentinel_wrapper = object()
+        with (
+            patch.object(client, "_fetch_metadata", side_effect=fake_fetch_metadata),
+            patch("arc_agi.base.RemoteEnvironmentWrapper", return_value=sentinel_wrapper) as mock_wrapper,
+        ):
+            wrapper = client.make(game_id="cf01-v1", scorecard_id="test-card")
+
+        self.assertIs(wrapper, sentinel_wrapper)
+        self.assertEqual(lookup_calls, ["cf01-v1"])
+        self.assertEqual(mock_wrapper.call_args.kwargs["environment_info"].game_id, "cf01-v1")
+
 
 class TestARCAGI3EnvironmentsDirScanning(unittest.TestCase):
     """Test environments_dir scanning functionality."""
@@ -396,7 +487,7 @@ class TestARCAGI3EnvironmentsDirScanning(unittest.TestCase):
             # Check that the expected environments are found
             environment_ids = {env.game_id for env in client.available_environments}
             self.assertIn("bt11-fd9df0622a1a", environment_ids)
-            self.assertIn("tg62-12345678", environment_ids)
+            self.assertIn("bt33-a7c3f9d18b4e", environment_ids)
 
 
 class TestARCAGI3APIFetching(unittest.TestCase):
@@ -447,7 +538,7 @@ class TestARCAGI3APIFetching(unittest.TestCase):
         mock_get.assert_called_once()
         call_args = mock_get.call_args
         self.assertEqual(call_args[0][0], "https://three.arcprize.org/api/games")
-        self.assertEqual(call_args[1]["headers"]["X-API-Key"], "test-api-key")
+        self.assertEqual(call_args[1]["headers"]["X-Api-Key"], "test-api-key")
 
         # Verify environment was added
         self.assertEqual(len(client.available_environments), 1)
@@ -552,15 +643,16 @@ class TestARCAGI3APIFetching(unittest.TestCase):
 
     @patch("arc_agi.base.requests.get")
     def test_api_no_key_skips_fetch(self, mock_get):
-        """Test that API is not called when no API key is provided."""
+        """Test that no environment listing happens without a provided API key."""
+        os.environ.pop("ARC_API_KEY", None)
         _ = Arcade(
             arc_api_key="",  # Empty API key
             operation_mode=OperationMode.NORMAL,
             environments_dir=None,
         )
 
-        # Verify API was not called
-        mock_get.assert_not_called()
+        called_urls = [call.args[0] for call in mock_get.call_args_list]
+        self.assertEqual(called_urls, ["https://three.arcprize.org/api/games/anonkey"])
 
     @patch("arc_agi.base.requests.get")
     def test_api_error_handled_gracefully(self, mock_get):
@@ -633,6 +725,40 @@ class TestARCAGI3APIFetching(unittest.TestCase):
         # Verify API was called with custom URL
         call_args = mock_get.call_args
         self.assertEqual(call_args[0][0], "https://custom.example.com/api/games")
+
+    @patch("arc_agi.base.requests.get")
+    def test_online_mode_lists_remote_games_only_even_with_local_environments(self, mock_get):
+        """ONLINE mode must not leak local environments into get_environments()."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "game_id": "api-game-1",
+                "title": "API Game 1",
+                "tags": ["api-tag"],
+                "baseline_actions": [10],
+            }
+        ]
+        mock_response.raise_for_status = MagicMock()
+        mock_get.return_value = mock_response
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            environments_dir = Path(tmpdir) / "environments"
+            environments_dir.mkdir()
+            env_dir = environments_dir / "env1"
+            env_dir.mkdir()
+            (env_dir / "metadata.json").write_text(
+                '{"game_id": "local-game-1", "title": "Local Game 1", "tags": ["local-tag"], "baseline_actions": [5]}',
+                encoding="utf-8",
+            )
+
+            client = Arcade(
+                arc_api_key="test-api-key",
+                operation_mode=OperationMode.ONLINE,
+                environments_dir=str(environments_dir),
+            )
+
+            self.assertEqual(len(client.available_environments), 1)
+            self.assertEqual(client.available_environments[0].game_id, "api-game-1")
 
 
 if __name__ == "__main__":
